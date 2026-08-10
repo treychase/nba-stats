@@ -12,12 +12,13 @@ Combines two data pulls for the current season into one script:
 Run main() to pull everything and write all CSVs, or import and call
 either function independently.
 
-Requires: pip install nba_api pandas
+Requires: pip install nba_api pandas tqdm
 """
 
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from nba_api.stats.endpoints import (
     leaguedashptstats,
     synergyplaytypes,
@@ -67,15 +68,15 @@ def pull_tracking_stats() -> pd.DataFrame:
     base_cols = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION"]
     all_frames = {}
 
-    for measure_type in PT_MEASURE_TYPES:
-        print(f"Pulling {measure_type}...")
+    pbar = tqdm(PT_MEASURE_TYPES, desc="Tracking stats", unit="category")
+    for measure_type in pbar:
+        pbar.set_postfix_str(measure_type)
         try:
             df = _pull_tracking_measure(measure_type)
             all_frames[measure_type] = df
             df.to_csv(f"tracking_{measure_type.lower()}_{SEASON}.csv", index=False)
-            print(f"  -> {len(df)} rows")
         except Exception as e:
-            print(f"  FAILED: {measure_type} ({e})")
+            tqdm.write(f"  FAILED: {measure_type} ({e})")
 
         time.sleep(REQUEST_DELAY)
 
@@ -126,20 +127,20 @@ def _pull_play_type(play_type: str, type_grouping: str) -> pd.DataFrame:
 def pull_pick_and_roll() -> pd.DataFrame:
     """Pull pick-and-roll ball handler + roll man stats, save individual + combined CSVs, return combined DataFrame."""
     all_frames = []
+    combos = [(pt, label, grouping) for pt, label in PLAY_TYPES.items() for grouping in TYPE_GROUPINGS]
 
-    for play_type, label in PLAY_TYPES.items():
-        for grouping in TYPE_GROUPINGS:
-            print(f"Pulling {play_type} ({grouping})...")
-            try:
-                df = _pull_play_type(play_type, grouping)
-                out_path = f"{label}_{grouping}_{SEASON}.csv"
-                df.to_csv(out_path, index=False)
-                all_frames.append(df)
-                print(f"  -> {len(df)} rows, saved to {out_path}")
-            except Exception as e:
-                print(f"  FAILED: {play_type} ({grouping}) ({e})")
+    pbar = tqdm(combos, desc="Pick-and-roll", unit="combo")
+    for play_type, label, grouping in pbar:
+        pbar.set_postfix_str(f"{play_type} ({grouping})")
+        try:
+            df = _pull_play_type(play_type, grouping)
+            out_path = f"{label}_{grouping}_{SEASON}.csv"
+            df.to_csv(out_path, index=False)
+            all_frames.append(df)
+        except Exception as e:
+            tqdm.write(f"  FAILED: {play_type} ({grouping}) ({e})")
 
-            time.sleep(REQUEST_DELAY)
+        time.sleep(REQUEST_DELAY)
 
     combined = None
     if all_frames:
@@ -170,35 +171,70 @@ def _get_active_player_ids() -> list:
     return df["PERSON_ID"].tolist()
 
 
+def _call_with_retry(func, *args, retries: int = 3, backoff: float = 2.0, label: str = "request", **kwargs):
+    """
+    Call func(*args, **kwargs), retrying on exception with exponential
+    backoff. stats.nba.com intermittently times out, especially on
+    league-wide calls or under concurrent load, so a single failure
+    doesn't necessarily mean anything's wrong on our end.
+    """
+    last_exception = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            if attempt < retries:
+                wait = backoff ** attempt
+                print(f"    retry {attempt}/{retries} for {label} after {wait:.1f}s ({e})")
+                time.sleep(wait)
+
+    raise last_exception
+
+
 def _get_player_ids_with_min_shots(min_shots: int = 50) -> list:
     """
     Return PLAYER_ID for players whose season field goal attempts (FGA)
     exceed min_shots. Used to skip players with too few shots to be worth
     pulling a full shot chart for (bench/two-way players, etc.).
     """
-    response = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Base",
-        per_mode_detailed="Totals",
-    )
-    df = response.get_data_frames()[0]
+    def _fetch():
+        response = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=SEASON,
+            season_type_all_star=SEASON_TYPE,
+            measure_type_detailed_defense="Base",
+            per_mode_detailed="Totals",
+            timeout=60,
+        )
+        return response.get_data_frames()[0]
+
+    df = _call_with_retry(_fetch, label="leaguedashplayerstats")
     filtered = df[df["FGA"] > min_shots]
     return filtered["PLAYER_ID"].tolist()
 
 
-def _pull_player_shot_chart(player_id: int) -> pd.DataFrame:
-    """Pull shot chart detail for a single player for the season."""
-    response = shotchartdetail.ShotChartDetail(
-        team_id=0,
-        player_id=player_id,
-        season_nullable=SEASON,
-        season_type_all_star=SEASON_TYPE,
-        context_measure_simple="FGA",
-    )
-    df = response.get_data_frames()[0]
-    df["SEASON"] = SEASON
-    return df
+def _pull_player_shot_chart(player_id: int, retries: int = 3, backoff: float = 2.0) -> pd.DataFrame:
+    """
+    Pull shot chart detail for a single player for the season, retrying
+    on timeout/connection errors with exponential backoff. stats.nba.com
+    intermittently times out under concurrent load, so a failed request
+    doesn't necessarily mean anything's wrong on our end.
+    """
+    def _fetch():
+        response = shotchartdetail.ShotChartDetail(
+            team_id=0,
+            player_id=player_id,
+            season_nullable=SEASON,
+            season_type_all_star=SEASON_TYPE,
+            context_measure_simple="FGA",
+            timeout=60,
+        )
+        df = response.get_data_frames()[0]
+        df["SEASON"] = SEASON
+        return df
+
+    return _call_with_retry(_fetch, retries=retries, backoff=backoff, label=f"player {player_id}")
 
 
 def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
@@ -223,8 +259,6 @@ def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
     print(f"  -> {len(player_ids)} players qualify (out of full league)")
 
     all_frames = []
-    completed = 0
-    total = len(player_ids)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_player = {
@@ -232,16 +266,16 @@ def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
             for player_id in player_ids
         }
 
-        for future in as_completed(future_to_player):
+        pbar = tqdm(as_completed(future_to_player), total=len(future_to_player), desc="Shot charts", unit="player")
+        for future in pbar:
             player_id = future_to_player[future]
-            completed += 1
             try:
                 df = future.result()
                 if not df.empty:
                     all_frames.append(df)
-                print(f"  ({completed}/{total}) player {player_id}: {len(df)} shots")
+                pbar.set_postfix_str(f"player {player_id}: {len(df)} shots")
             except Exception as e:
-                print(f"  ({completed}/{total}) FAILED: player {player_id} ({e})")
+                tqdm.write(f"  FAILED: player {player_id} ({e})")
 
     combined = None
     if all_frames:

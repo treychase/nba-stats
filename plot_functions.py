@@ -327,9 +327,10 @@ def plot_player_season_shot_chart(
         nba_data_pull.py. Must contain PLAYER_ID, LOC_X, LOC_Y, and the
         columns named by player_col / season_col.
     player : str or int
-        Player name (matches player_col) or PLAYER_ID to filter on.
-        If player_col values are strings, pass a string; if you'd rather
-        filter by ID directly, pass an int and set player_col="PLAYER_ID".
+        Player name (matches player_col, case-insensitive) or PLAYER_ID
+        to filter on. If player_col values are strings, pass a string;
+        if you'd rather filter by ID directly, pass an int and set
+        player_col="PLAYER_ID".
     season : str
         Season to filter on, e.g. "2025-26". Must match values in
         season_col.
@@ -358,7 +359,14 @@ def plot_player_season_shot_chart(
     ValueError
         If no rows match the given player/season filter.
     """
-    filtered = df[(df[player_col] == player) & (df[season_col] == season)]
+    if isinstance(player, str):
+        # Case-insensitive match on player name (e.g. "PLAYER_NAME")
+        mask = df[player_col].str.lower() == player.lower()
+    else:
+        # Numeric filter, e.g. player_col="PLAYER_ID"
+        mask = df[player_col] == player
+
+    filtered = df[mask & (df[season_col] == season)]
 
     if filtered.empty:
         raise ValueError(
@@ -370,7 +378,7 @@ def plot_player_season_shot_chart(
     if show_headshot and "PLAYER_ID" in filtered.columns:
         player_id = filtered["PLAYER_ID"].iloc[0]
 
-    display_name = player if player_col == "PLAYER_NAME" else filtered["PLAYER_NAME"].iloc[0]
+    display_name = filtered["PLAYER_NAME"].iloc[0] if "PLAYER_NAME" in filtered.columns else player
     title = f"{display_name} — {season} Shot Chart ({len(filtered)} shots)"
 
     if ax is None:
