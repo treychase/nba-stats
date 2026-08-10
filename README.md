@@ -1,2 +1,3 @@
-# nba-stats
-Master repo for nba stats analysis
+# NBA Stats
+
+Master repo for nba stats analysis.
