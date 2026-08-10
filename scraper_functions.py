@@ -17,7 +17,14 @@ Requires: pip install nba_api pandas
 
 import time
 import pandas as pd
-from nba_api.stats.endpoints import leaguedashptstats, synergyplaytypes, shotchartdetail, commonallplayers
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from nba_api.stats.endpoints import (
+    leaguedashptstats,
+    synergyplaytypes,
+    shotchartdetail,
+    commonallplayers,
+    leaguedashplayerstats,
+)
 
 SEASON = "2025-26"
 SEASON_TYPE = "Regular Season"
@@ -163,6 +170,23 @@ def _get_active_player_ids() -> list:
     return df["PERSON_ID"].tolist()
 
 
+def _get_player_ids_with_min_shots(min_shots: int = 50) -> list:
+    """
+    Return PLAYER_ID for players whose season field goal attempts (FGA)
+    exceed min_shots. Used to skip players with too few shots to be worth
+    pulling a full shot chart for (bench/two-way players, etc.).
+    """
+    response = leaguedashplayerstats.LeagueDashPlayerStats(
+        season=SEASON,
+        season_type_all_star=SEASON_TYPE,
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+    )
+    df = response.get_data_frames()[0]
+    filtered = df[df["FGA"] > min_shots]
+    return filtered["PLAYER_ID"].tolist()
+
+
 def _pull_player_shot_chart(player_id: int) -> pd.DataFrame:
     """Pull shot chart detail for a single player for the season."""
     response = shotchartdetail.ShotChartDetail(
@@ -177,23 +201,47 @@ def _pull_player_shot_chart(player_id: int) -> pd.DataFrame:
     return df
 
 
-def pull_shot_chart() -> pd.DataFrame:
-    """Pull per-shot chart data for every active player, save combined CSV, return DataFrame."""
-    print("Fetching active player list...")
-    player_ids = _get_active_player_ids()
-    print(f"  -> {len(player_ids)} players")
+def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
+    """
+    Pull per-shot chart data in parallel for players with more than
+    min_shots field goal attempts on the season, save combined CSV,
+    return DataFrame.
+
+    Parameters
+    ----------
+    min_shots : int
+        Minimum season FGA required for a player to be included. Filters
+        out low-volume/bench players before hitting the API.
+    max_workers : int
+        Number of concurrent threads to use for shot chart requests.
+        Since this is I/O-bound (waiting on stats.nba.com), threading
+        gives a real speedup despite the GIL. Push much above 8-10 and
+        you risk getting rate-limited or temporarily blocked.
+    """
+    print(f"Fetching players with FGA > {min_shots}...")
+    player_ids = _get_player_ids_with_min_shots(min_shots)
+    print(f"  -> {len(player_ids)} players qualify (out of full league)")
 
     all_frames = []
-    for i, player_id in enumerate(player_ids, start=1):
-        try:
-            df = _pull_player_shot_chart(player_id)
-            if not df.empty:
-                all_frames.append(df)
-            print(f"  ({i}/{len(player_ids)}) player {player_id}: {len(df)} shots")
-        except Exception as e:
-            print(f"  ({i}/{len(player_ids)}) FAILED: player {player_id} ({e})")
+    completed = 0
+    total = len(player_ids)
 
-        time.sleep(REQUEST_DELAY)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_player = {
+            executor.submit(_pull_player_shot_chart, player_id): player_id
+            for player_id in player_ids
+        }
+
+        for future in as_completed(future_to_player):
+            player_id = future_to_player[future]
+            completed += 1
+            try:
+                df = future.result()
+                if not df.empty:
+                    all_frames.append(df)
+                print(f"  ({completed}/{total}) player {player_id}: {len(df)} shots")
+            except Exception as e:
+                print(f"  ({completed}/{total}) FAILED: player {player_id} ({e})")
 
     combined = None
     if all_frames:
