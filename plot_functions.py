@@ -158,15 +158,17 @@ def plot_shot_hexbin(
     x_col="LOC_X",
     y_col="LOC_Y",
     gridsize=30,
-    cmap="YlOrRd",
+    cmap=None,
     mincnt=1,
     colorbar=True,
     title=None,
     player_id=None,
     headshot_corner="upper right",
+    color_by="count",
+    made_col="SHOT_MADE_FLAG",
 ):
     """
-    Draw a court and overlay a hexbin density plot of shot locations.
+    Draw a court and overlay a hexbin plot of shot locations.
 
     Parameters
     ----------
@@ -179,12 +181,15 @@ def plot_shot_hexbin(
         Column names for shot x/y coordinates.
     gridsize : int
         Number of hexagons across the x-axis; controls bin resolution.
-    cmap : str
-        Matplotlib colormap for hexbin density/frequency.
+    cmap : str, optional
+        Matplotlib colormap. Defaults to "YlOrRd" for count mode, or a
+        blue (0%) to red (100%) diverging map for fg_pct mode.
     mincnt : int
-        Minimum count for a hexagon to be shown (filters out empty bins).
+        Minimum shot attempts for a hexagon to be shown. Bins below this
+        are left blank (transparent), not colored, so zero-attempt areas
+        show the plain white court background.
     colorbar : bool
-        Whether to attach a colorbar for shot count.
+        Whether to attach a colorbar.
     title : str, optional
         Title to place above the plot.
     player_id : int, optional
@@ -193,29 +198,60 @@ def plot_shot_hexbin(
     headshot_corner : str
         Corner to place the headshot in, if player_id is given. One of
         "upper left", "upper right", "lower left", "lower right".
+    color_by : str
+        "count" colors hexagons by shot attempt volume (original
+        behavior). "fg_pct" colors hexagons by field goal percentage
+        made within that bin, on a fixed 0%-100% blue-to-red scale,
+        regardless of how the data happens to be distributed.
+    made_col : str
+        Column of 0/1 (or True/False) make flags, used when
+        color_by="fg_pct". Matches shotchartdetail's SHOT_MADE_FLAG.
 
     Returns
     -------
     ax : matplotlib Axes
         The axes with the court and hexbin overlay drawn on it.
     """
+    if color_by not in ("count", "fg_pct"):
+        raise ValueError('color_by must be "count" or "fg_pct"')
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 7.5))
 
-    hb = ax.hexbin(
-        df[x_col],
-        df[y_col],
+    hexbin_kwargs = dict(
         gridsize=gridsize,
-        cmap=cmap,
         mincnt=mincnt,
         extent=(-250, 250, -47.5, 422.5),
     )
+
+    if color_by == "fg_pct":
+        hb = ax.hexbin(
+            df[x_col],
+            df[y_col],
+            C=df[made_col],
+            reduce_C_function=lambda vals: sum(vals) / len(vals),
+            cmap=cmap or "coolwarm",
+            vmin=0,
+            vmax=1,
+            **hexbin_kwargs,
+        )
+        colorbar_label = "FG%"
+    else:
+        hb = ax.hexbin(
+            df[x_col],
+            df[y_col],
+            cmap=cmap or "YlOrRd",
+            **hexbin_kwargs,
+        )
+        colorbar_label = "Shot count"
 
     draw_court(ax, color="black", lw=1.5)
 
     if colorbar:
         fig = ax.get_figure()
-        fig.colorbar(hb, ax=ax, label="Shot count", fraction=0.035, pad=0.02)
+        cb = fig.colorbar(hb, ax=ax, label=colorbar_label, fraction=0.035, pad=0.02)
+        if color_by == "fg_pct":
+            cb.ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
 
     if title:
         ax.set_title(title, fontsize=13)
@@ -309,12 +345,14 @@ def plot_player_season_shot_chart(
     season_col="SEASON",
     ax=None,
     gridsize=30,
-    cmap="YlOrRd",
+    cmap=None,
     mincnt=1,
     colorbar=True,
     show_headshot=True,
     headshot_corner="upper right",
     zoom=0.35,
+    color_by="fg_pct",
+    made_col="SHOT_MADE_FLAG",
 ):
     """
     Filter a shot chart DataFrame down to one player/season and plot the
@@ -325,7 +363,8 @@ def plot_player_season_shot_chart(
     df : pandas.DataFrame
         Full shot chart data, e.g. output of pull_shot_chart() from
         nba_data_pull.py. Must contain PLAYER_ID, LOC_X, LOC_Y, and the
-        columns named by player_col / season_col.
+        columns named by player_col / season_col. For color_by="fg_pct"
+        (the default), it must also contain made_col.
     player : str or int
         Player name (matches player_col, case-insensitive) or PLAYER_ID
         to filter on. If player_col values are strings, pass a string;
@@ -340,7 +379,7 @@ def plot_player_season_shot_chart(
         Column name to filter season on. Defaults to "SEASON".
     ax : matplotlib Axes, optional
         Axes to draw on. Creates a new figure/axes if not provided.
-    gridsize, cmap, mincnt, colorbar : see plot_shot_hexbin.
+    gridsize, cmap, mincnt, colorbar, color_by, made_col : see plot_shot_hexbin.
     show_headshot : bool
         Whether to inset the player's headshot (requires a PLAYER_ID
         column in df to look up the ID).
@@ -394,6 +433,8 @@ def plot_player_season_shot_chart(
         title=title,
         player_id=player_id if show_headshot else None,
         headshot_corner=headshot_corner,
+        color_by=color_by,
+        made_col=made_col,
     )
 
     return ax
