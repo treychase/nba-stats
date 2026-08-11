@@ -288,6 +288,41 @@ def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Season box score totals
+# ---------------------------------------------------------------------------
+# The shot chart feed covers every field goal attempt but no free throws,
+# so free throw % and true shooting % can't be derived from it. This pulls
+# the season totals that fill that gap (PTS, FGA, FTM, FTA, ...).
+
+BOX_TOTALS_COLUMNS = [
+    "PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION", "GP", "MIN",
+    "PTS", "FGM", "FGA", "FG_PCT", "FG3M", "FG3A", "FG3_PCT", "FTM", "FTA", "FT_PCT",
+]
+
+
+def pull_player_box_stats() -> pd.DataFrame:
+    """Pull season box score totals for every player, save CSV, return DataFrame."""
+    def _fetch():
+        response = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=SEASON,
+            season_type_all_star=SEASON_TYPE,
+            measure_type_detailed_defense="Base",
+            per_mode_detailed="Totals",
+            timeout=60,
+        )
+        return response.get_data_frames()[0]
+
+    df = _call_with_retry(_fetch, label="leaguedashplayerstats totals")
+    df = df[[c for c in BOX_TOTALS_COLUMNS if c in df.columns]]
+
+    out_path = f"nba_player_box_{SEASON}.csv"
+    df.to_csv(out_path, index=False)
+    print(f"Box score totals saved: {out_path} ({len(df)} rows)")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -300,6 +335,9 @@ def main():
 
     print("\n=== Pulling shot chart data ===")
     pull_shot_chart()
+
+    print("\n=== Pulling season box score totals ===")
+    pull_player_box_stats()
 
 
 if __name__ == "__main__":
