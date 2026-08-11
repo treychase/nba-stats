@@ -1,0 +1,5 @@
+matplotlib
+nba_api
+pandas
+streamlit
+tqdm
