@@ -263,6 +263,90 @@ def plot_shot_hexbin(
 
 
 # ---------------------------------------------------------------------------
+# Touch areas
+# ---------------------------------------------------------------------------
+# Rectangles marking where the NBA's tracking data counts a touch, in the
+# same coordinate system as draw_court (1/10 ft, origin at the basket).
+# Areas with two rectangles are the symmetric left/right halves of the same
+# area and always carry the same value.
+
+TOUCH_AREA_RECTS = {
+    # (x, y) of lower-left corner, width, height
+    "paint": [(-80, -47.5, 160, 190)],
+    "post": [(-140, -47.5, 60, 120), (80, -47.5, 60, 120)],
+    "elbow": [(-110, 112.5, 60, 60), (50, 112.5, 60, 60)],
+}
+
+
+def plot_touch_areas(shares, colors=None, ax=None, title=None, labels=None, ymax=300):
+    """
+    Draw a court with the touch tracking areas shaded and labelled with a
+    player's share of touches in each.
+
+    Parameters
+    ----------
+    shares : dict
+        Maps area key ("paint", "post", "elbow") to that player's share of
+        touches in the area, as a fraction (0-1). NaN or None renders the
+        area empty with a dash.
+    colors : dict, optional
+        Maps area key to a matplotlib color for the fill. Areas missing
+        from the dict (or mapped to None) are filled light grey.
+    ax : matplotlib Axes, optional
+        Axes to draw on. Creates a new figure/axes if not provided.
+    title : str, optional
+        Title to place above the plot.
+    labels : dict, optional
+        Maps area key to the display name drawn in the area. Defaults to
+        the capitalised key.
+    ymax : float
+        Top of the y range. Every touch area sits below the free throw
+        line, so the default crops off the empty top of the half court
+        rather than shrinking the areas into a corner. Pass 422.5 to
+        show the full half court.
+
+    Returns
+    -------
+    ax : matplotlib Axes
+        The axes with the court and shaded touch areas drawn on it.
+    """
+    if ax is None:
+        _fig, ax = plt.subplots(figsize=(8, 7.5))
+
+    colors = colors or {}
+    labels = labels or {}
+
+    for area, rects in TOUCH_AREA_RECTS.items():
+        share = shares.get(area)
+        text = f"{share:.1%}" if share is not None and pd.notna(share) else "—"
+        name = labels.get(area, area.title())
+
+        for x, y, width, height in rects:
+            ax.add_patch(
+                Rectangle(
+                    (x, y), width, height,
+                    facecolor=colors.get(area) or "#d9d9d9",
+                    edgecolor="black",
+                    linewidth=1.2,
+                    alpha=0.85,
+                    zorder=2,
+                )
+            )
+            ax.text(
+                x + width / 2, y + height / 2, f"{name}\n{text}",
+                ha="center", va="center", fontsize=9, color="#262730", zorder=3,
+            )
+
+    draw_court(ax, color="black", lw=1.5)
+    ax.set_ylim(-60, ymax)
+
+    if title:
+        ax.set_title(title, fontsize=13)
+
+    return ax
+
+
+# ---------------------------------------------------------------------------
 # Player headshot inset
 # ---------------------------------------------------------------------------
 

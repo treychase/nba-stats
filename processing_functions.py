@@ -330,6 +330,146 @@ def build_shooting_splits(shots, box=None, shot_value_col="SHOT_TYPE", zone_col=
     return splits[ordered].sort_values("PLAYER_NAME").reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Touch locations (share of a player's touches by area of the court)
+# ---------------------------------------------------------------------------
+
+TOUCH_AREAS = [
+    # (share column, label, touch count column, court area key used for plotting)
+    ("PAINT_TOUCH_PCT", "Paint", "PAINT_TOUCHES", "paint"),
+    ("POST_TOUCH_PCT", "Post", "POST_TOUCHES", "post"),
+    ("ELBOW_TOUCH_PCT", "Elbow", "ELBOW_TOUCHES", "elbow"),
+]
+
+MIN_TOUCHES = 200
+
+
+def build_touch_profile(possessions, min_touches=MIN_TOUCHES):
+    """
+    Build a per-player touch profile: what share of a player's touches
+    happen in the paint, in the post and at the elbow, each with its
+    league percentile.
+
+    Parameters
+    ----------
+    possessions : pandas.DataFrame
+        Possessions tracking data, e.g.
+        data/tracking_possessions_2025-26.csv from pull_tracking_stats().
+        Needs PLAYER_ID, PLAYER_NAME, TOUCHES, and the per-area touch
+        count columns listed in TOUCH_AREAS.
+    min_touches : int
+        Total touches a player needs before they're ranked. Below this a
+        handful of post-ups swings the share wildly, so those players
+        still get their shares but no percentile.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per player with PLAYER_ID, PLAYER_NAME, TOUCHES, the raw
+        per-area counts, a <AREA>_TOUCH_PCT share (0-1) for each area,
+        and a matching <AREA>_TOUCH_PCT_PCTILE column (0-100).
+    """
+    count_cols = [count_col for _share, _label, count_col, _key in TOUCH_AREAS]
+    required = ["PLAYER_ID", "PLAYER_NAME", "TOUCHES"] + count_cols
+    missing = [c for c in required if c not in possessions.columns]
+    if missing:
+        raise KeyError(f"Possessions tracking data is missing columns: {missing}")
+
+    profile = possessions[required].copy()
+    touches = profile["TOUCHES"].replace(0, pd.NA)
+    qualified = profile["TOUCHES"] >= min_touches
+
+    for share_col, _label, count_col, _key in TOUCH_AREAS:
+        profile[share_col] = profile[count_col] / touches
+        profile[f"{share_col}_PCTILE"] = (
+            pd.to_numeric(profile[share_col], errors="coerce").where(qualified).rank(pct=True) * 100
+        )
+
+    return profile.sort_values("PLAYER_NAME").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Pick and roll scoring (ball handlers and roll men)
+# ---------------------------------------------------------------------------
+# Synergy splits the pick and roll into two roles, which in practice sorts
+# players by position: guards run it as the ball handler, bigs finish it as
+# the roll man. Rather than joining a position list, each role is ranked
+# against the players who actually log possessions in that role, so a big
+# is percentiled against other roll men and a guard against other handlers.
+
+PNR_ROLES = [
+    # (column prefix, label, PLAY_TYPE value in the Synergy pull)
+    ("HANDLER", "Ball handler", "PRBallHandler"),
+    ("ROLL", "Roll man", "PRRollman"),
+]
+
+MIN_PNR_POSS = 25
+
+
+def build_pick_and_roll_profile(pnr, min_poss=MIN_PNR_POSS):
+    """
+    Build a per-player pick and roll scoring profile: points scored as the
+    ball handler and as the roll man, each with its league percentile
+    among players who log real volume in that role.
+
+    Parameters
+    ----------
+    pnr : pandas.DataFrame
+        Combined Synergy play type data, e.g.
+        data/nba_pick_and_roll_combined_2025-26.csv from
+        pull_pick_and_roll(). Needs PLAYER_ID, PLAYER_NAME, PLAY_TYPE,
+        TYPE_GROUPING, POSS and PTS. Only offensive rows are used.
+    min_poss : int
+        Possessions in a role before a player is ranked in it.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per player with PLAYER_ID, PLAYER_NAME, TEAM_ABBREVIATION,
+        <ROLE>_PTS / <ROLE>_POSS / <ROLE>_PTS_PCTILE per role, and
+        PRIMARY_ROLE naming whichever role they run more often.
+    """
+    required = ["PLAYER_ID", "PLAYER_NAME", "PLAY_TYPE", "TYPE_GROUPING", "POSS", "PTS"]
+    missing = [c for c in required if c not in pnr.columns]
+    if missing:
+        raise KeyError(f"Pick and roll data is missing columns: {missing}")
+
+    offense = pnr[pnr["TYPE_GROUPING"].str.lower() == "offensive"]
+
+    players = (
+        offense[["PLAYER_ID", "PLAYER_NAME"]]
+        .drop_duplicates(subset="PLAYER_ID")
+        .reset_index(drop=True)
+    )
+    if "TEAM_ABBREVIATION" in offense.columns:
+        teams = offense.drop_duplicates(subset="PLAYER_ID").set_index("PLAYER_ID")["TEAM_ABBREVIATION"]
+        players["TEAM_ABBREVIATION"] = players["PLAYER_ID"].map(teams)
+
+    profile = players
+    for prefix, _label, play_type in PNR_ROLES:
+        role = (
+            offense[offense["PLAY_TYPE"] == play_type]
+            .groupby("PLAYER_ID")[["POSS", "PTS"]]
+            .sum()
+            .rename(columns={"POSS": f"{prefix}_POSS", "PTS": f"{prefix}_PTS"})
+        )
+        profile = profile.merge(role, on="PLAYER_ID", how="left")
+
+        qualified = profile[f"{prefix}_POSS"] >= min_poss
+        profile[f"{prefix}_PTS_PCTILE"] = (
+            pd.to_numeric(profile[f"{prefix}_PTS"], errors="coerce").where(qualified).rank(pct=True) * 100
+        )
+
+    handler_poss = profile["HANDLER_POSS"].fillna(0)
+    roll_poss = profile["ROLL_POSS"].fillna(0)
+    profile["PRIMARY_ROLE"] = pd.Series(
+        ["Ball handler" if h >= r else "Roll man" for h, r in zip(handler_poss, roll_poss)],
+        index=profile.index,
+    ).where(handler_poss + roll_poss > 0)
+
+    return profile.sort_values("PLAYER_NAME").reset_index(drop=True)
+
+
 if __name__ == "__main__":
     # Quick smoke test
     sample = pd.DataFrame({
