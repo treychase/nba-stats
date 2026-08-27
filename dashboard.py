@@ -29,6 +29,11 @@ import pandas as pd
 import streamlit as st
 
 from archetypes import MIN_MINUTES, build_archetype_features, fit_archetypes
+from true_shooting import (
+    build_shooting_panel,
+    fit_shrinkage,
+    project_true_shooting,
+)
 from dashboard_tables import (
     PERCENTILE_COL,
     percentile_color,
@@ -136,6 +141,25 @@ def load_archetypes():
     return fit_archetypes(features)
 
 
+@st.cache_data(show_spinner="Projecting true shooting…")
+def load_projection():
+    """Reconstruct true shooting and pool it, or None if a pull is missing.
+
+    Cached as one unit because the three steps share the same inputs and the
+    shrinkage constant has to be fitted before the projection can use it.
+    """
+    if not (TRACKING_PATH.exists() and POSSESSIONS_PATH.exists()):
+        return None
+    tracking = pd.read_csv(TRACKING_PATH)
+    panel = build_shooting_panel(load_shots(), load_possessions(), tracking)
+    calibration = fit_shrinkage(load_shots())
+    model = load_archetypes()
+    groups = (model.table.set_index("PLAYER_ID")["ARCHETYPE"]
+              if model is not None else None)
+    return project_true_shooting(panel, k=calibration["k"], groups=groups,
+                                 calibration=calibration)
+
+
 @st.cache_data
 def load_pick_and_roll() -> pd.DataFrame | None:
     """Build the league-wide pick and roll dataset, or None if not pulled yet."""
@@ -239,8 +263,8 @@ with card_right:
 
 st.divider()
 
-scouting_tab, touches_tab, archetype_tab = st.tabs(
-    ["Scouting", "Touches & Pick and Roll", "Archetypes"]
+scouting_tab, touches_tab, archetype_tab, shooting_tab = st.tabs(
+    ["Scouting", "Touches & Pick and Roll", "Archetypes", "Projected true shooting"]
 )
 
 with scouting_tab:
@@ -455,3 +479,101 @@ with archetype_tab:
                 "Most minutes": ", ".join(members.nlargest(3, "MIN")["PLAYER_NAME"]),
             })
         st.dataframe(pd.DataFrame(summary_rows), hide_index=True)
+
+
+with shooting_tab:
+    st.subheader("Projected true shooting")
+    projection = load_projection()
+
+    if projection is None:
+        st.info(
+            "Projected true shooting needs the tracking and possessions pulls. "
+            "Run `pull_tracking_stats()` from `scraper_functions.py`."
+        )
+    else:
+        calibration = projection.calibration
+        st.caption(
+            f"True shooting is reconstructed from the shot chart and season points "
+            f"— free throws made are points minus what the field goals were worth — "
+            f"then pooled toward the player's archetype. The pooling constant "
+            f"k = {projection.k:.0f} attempts is fitted, not chosen: it is the value "
+            f"that best predicts shooting after "
+            f"{calibration['cut']:%B %-d} from shooting before it, across "
+            f"{calibration['n_players']} players."
+        )
+
+        row = projection.of(player_id)
+        if row is None:
+            st.info(f"No shot chart for {player_name}, so there is nothing to project.")
+        else:
+            low = row["PROJECTED_TS"] - 1.96 * row["SE"]
+            high = row["PROJECTED_TS"] + 1.96 * row["SE"]
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Shot", f"{row['TS_PCT']:.1%}")
+            metric_cols[1].metric("Projected", f"{row['PROJECTED_TS']:.1%}",
+                                  delta=f"{row['SHIFT']:+.1%}")
+            metric_cols[2].metric("95% interval", f"{low:.1%} – {high:.1%}")
+            metric_cols[3].metric("True shooting attempts", f"{row['TSA']:,.0f}")
+
+            group = row["ARCHETYPE"] or "the league"
+            st.markdown(
+                f"On {row['TSA']:,.0f} true shooting attempts, "
+                f"**{row['WEIGHT']:.0%}** of the projection is {player_name}'s own "
+                f"record and **{1 - row['WEIGHT']:.0%}** is "
+                f"{group} at {row['GROUP_TS']:.1%}."
+            )
+
+        st.divider()
+        left, right = st.columns([3, 2])
+
+        with left:
+            st.markdown("**How far each player is pulled**")
+            plot = projection.table[["TSA", "TS_PCT", "PROJECTED_TS"]].copy()
+            plot = plot.rename(columns={"TS_PCT": "Shot", "PROJECTED_TS": "Projected"})
+            st.scatter_chart(plot, x="TSA", y=["Shot", "Projected"],
+                             x_label="True shooting attempts", y_label="True shooting %")
+            st.caption(
+                "The two clouds are the same players. Out at high volume they sit on "
+                "top of each other; the gap opens up on the left, where a season is "
+                "too short to tell a hot stretch from a shooter."
+            )
+
+        with right:
+            st.markdown("**Where each archetype shoots from**")
+            groups_table = projection.groups.rename(columns={
+                "ARCHETYPE": "Archetype", "PLAYERS": "Players",
+                "GROUP_TS": "Pooled TS%"})
+            st.dataframe(
+                groups_table[["Archetype", "Players", "Pooled TS%"]],
+                hide_index=True,
+                column_config={"Pooled TS%": st.column_config.NumberColumn(format="%.3f")},
+            )
+            st.caption(
+                f"League {projection.league:.1%}. These are what a low-volume player "
+                "is pulled toward, so a reserve big is measured against other bigs "
+                "rather than against pull-up guards."
+            )
+
+        st.divider()
+        st.markdown("**Biggest corrections**")
+        movers = projection.table.assign(ABS=projection.table["SHIFT"].abs())
+        movers = movers.nlargest(12, "ABS")[
+            ["PLAYER_NAME", "TEAM_ABBREVIATION", "ARCHETYPE", "TSA",
+             "TS_PCT", "PROJECTED_TS", "SHIFT"]]
+        st.dataframe(
+            movers.rename(columns={
+                "PLAYER_NAME": "Player", "TEAM_ABBREVIATION": "Team",
+                "ARCHETYPE": "Archetype", "TSA": "Attempts",
+                "TS_PCT": "Shot", "PROJECTED_TS": "Projected", "SHIFT": "Change"}),
+            hide_index=True,
+            column_config={
+                "Attempts": st.column_config.NumberColumn(format="%.0f"),
+                "Shot": st.column_config.NumberColumn(format="%.3f"),
+                "Projected": st.column_config.NumberColumn(format="%.3f"),
+                "Change": st.column_config.NumberColumn(format="%+.3f"),
+            },
+        )
+        st.caption(
+            "Every one of these is a small sample. A player who takes 900 attempts "
+            "has already told you what he is; a player who takes 90 has not."
+        )

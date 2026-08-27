@@ -1,9 +1,16 @@
 """Player archetypes: k-means over the tracking data, with names attached.
 
 Position labels stopped describing how NBA players are used a while ago, so
-this clusters players on *what they actually do* - where they get the ball, how
-they shoot, how much they create, how they rebound and defend - and gives each
-cluster a readable name.
+this clusters players on *what they actually do* - what kind of shots they
+take and from where, how much they create for others, how they rebound and how
+they defend - and gives each cluster a readable name.
+
+Deliberately no touch counts. A touch says a player had the ball; it does not
+say what he did with it, so clustering on touches groups everyone who gets fed
+regardless of whether they shoot, pass or draw a foul. Field goal attempts
+split by type (catch and shoot, pull-up, drive) and by where they come from
+(paint, post, elbow) say what a possession turns into; passes, potential
+assists, rebounds, steals and blocks say what a player does without the ball.
 
 Three decisions shape the result:
 
@@ -17,7 +24,12 @@ including them drags cluster centres toward whatever their small samples say.
 They come back as ``None`` rather than being forced into a bucket.
 
 **Named by prototype, not by hand.** ``k`` is chosen by silhouette score over
-:data:`K_RANGE`, so the number of archetypes is read off the data. Each cluster
+:data:`K_RANGE`, so the number of archetypes is read off the data, subject to
+one product constraint: no cluster may hold more than
+:data:`MAX_CLUSTER_SHARE` of the league or fewer than
+:data:`MIN_CLUSTER_SHARE`. Unconstrained silhouette prefers four clusters here,
+one of which is half of everybody, which is a true statement about the data and
+a useless one to scout with. Each cluster
 centre is then matched to the nearest of the prototypes in
 :data:`PROTOTYPES` - a weight vector over the same standardized features - and
 takes that prototype's name. The features that actually distinguish the cluster
@@ -39,6 +51,8 @@ from sklearn.preprocessing import StandardScaler
 __all__ = [
     "FEATURES",
     "K_RANGE",
+    "MAX_CLUSTER_SHARE",
+    "MIN_CLUSTER_SHARE",
     "MIN_MINUTES",
     "PROTOTYPES",
     "ArchetypeModel",
@@ -47,29 +61,44 @@ __all__ = [
 ]
 
 MIN_MINUTES = 250.0
-K_RANGE = range(4, 9)
+K_RANGE = range(4, 11)
 PER = 36.0
 
+# Silhouette on its own keeps choosing k = 4, which puts half the league in one
+# cluster: real structure, but not an archetype - "the other 49%" tells a scout
+# nothing. A cluster has to be small enough to describe a role and big enough
+# to be one, and the best silhouette among the k that manage both is taken.
+MAX_CLUSTER_SHARE = 0.25
+MIN_CLUSTER_SHARE = 0.03
+
 # (source column, feature name, per-36 or as-is)
+#
+# Three families, and deliberately no touch counts. A touch says a player had
+# the ball; it does not say what he did with it, and clustering on touches
+# groups everyone who is fed the ball a lot regardless of whether they shoot,
+# pass or get fouled. Shot attempts broken out by type and by where they come
+# from say what a player does with a possession; passing, rebounding and the
+# two turnover-forcing defensive counts say what he does without one.
 FEATURES: list[tuple[str, str, bool]] = [
-    ("PAINT_TOUCHES", "Paint touches", True),
-    ("POST_TOUCHES", "Post touches", True),
-    ("ELBOW_TOUCHES", "Elbow touches", True),
-    ("DRIVES", "Drives", True),
+    # Field goal frequency and type
+    ("CATCH_SHOOT_FGA", "Catch & shoot FGA", True),
     ("CATCH_SHOOT_FG3A", "Catch & shoot 3PA", True),
     ("PULL_UP_FGA", "Pull-up FGA", True),
-    ("POTENTIAL_AST", "Potential assists", True),
+    ("PULL_UP_FG3A", "Pull-up 3PA", True),
+    ("DRIVE_FGA", "Drive FGA", True),
+    ("PAINT_TOUCH_FGA", "Paint FGA", True),
+    ("POST_TOUCH_FGA", "Post-up FGA", True),
+    ("ELBOW_TOUCH_FGA", "Elbow FGA", True),
+    # Passing
     ("PASSES_MADE", "Passes made", True),
-    ("TIME_OF_POSS", "Time of possession", True),
-    ("AVG_SEC_PER_TOUCH", "Seconds per touch", False),
-    ("AVG_DRIB_PER_TOUCH", "Dribbles per touch", False),
-    ("OREB_CHANCES", "Off. board chances", True),
-    ("DREB_CHANCES", "Def. board chances", True),
-    ("DEF_RIM_FGA", "Rim shots defended", True),
-    ("BLK", "Blocks", True),
+    ("POTENTIAL_AST", "Potential assists", True),
+    ("AST_TO_PASS_PCT", "Assists per pass", False),
+    # Rebounding
+    ("OREB", "Offensive rebounds", True),
+    ("DREB_Rebounding", "Defensive rebounds", True),
+    # Defence
     ("STL", "Steals", True),
-    ("AVG_SPEED_OFF", "Speed on offense", False),
-    ("PTS_PER_TOUCH", "Points per touch", False),
+    ("BLK", "Blocks", True),
 ]
 
 FEATURE_NAMES = [name for _column, name, _rate in FEATURES]
@@ -80,42 +109,47 @@ FEATURE_NAMES = [name for _column, name, _rate in FEATURES]
 # thing wins over a cluster that is mildly several.
 PROTOTYPES: dict[str, dict[str, float]] = {
     "Rim-running big": {
-        "Paint touches": 1.0, "Off. board chances": 1.0, "Rim shots defended": 0.8,
-        "Blocks": 0.6, "Catch & shoot 3PA": -0.8, "Pull-up FGA": -0.6,
-        "Time of possession": -0.5,
+        "Paint FGA": 1.1, "Offensive rebounds": 1.0, "Blocks": 0.8,
+        "Defensive rebounds": 0.6, "Catch & shoot 3PA": -0.8,
+        "Pull-up FGA": -0.7, "Passes made": -0.5,
     },
     "Stretch big": {
-        "Catch & shoot 3PA": 1.0, "Def. board chances": 0.8, "Rim shots defended": 0.6,
-        "Paint touches": 0.4, "Drives": -0.4, "Dribbles per touch": -0.5,
+        "Catch & shoot 3PA": 1.1, "Catch & shoot FGA": 0.8,
+        "Defensive rebounds": 0.8, "Blocks": 0.7, "Offensive rebounds": 0.4,
+        "Drive FGA": -0.5, "Pull-up FGA": -0.5,
     },
-    "Post hub": {
-        "Post touches": 1.2, "Elbow touches": 0.8, "Passes made": 0.5,
-        "Seconds per touch": 0.5, "Pull-up FGA": -0.3,
+    "Post scorer": {
+        "Post-up FGA": 1.3, "Elbow FGA": 0.8, "Paint FGA": 0.6,
+        "Potential assists": 0.4, "Catch & shoot 3PA": -0.4,
     },
+    # What separates these two is shooting off the dribble, not passing: both
+    # groups pass, only one of them is the shot at the end of the possession.
     "Primary creator": {
-        "Time of possession": 1.2, "Potential assists": 1.0, "Pull-up FGA": 0.8,
-        "Dribbles per touch": 0.8, "Drives": 0.6, "Off. board chances": -0.6,
+        "Pull-up FGA": 1.2, "Pull-up 3PA": 1.0, "Drive FGA": 0.8,
+        "Potential assists": 0.7, "Assists per pass": 0.7,
+        "Paint FGA": -0.5, "Offensive rebounds": -0.6, "Catch & shoot 3PA": -0.3,
     },
     "Secondary playmaker": {
-        "Passes made": 0.9, "Potential assists": 0.7, "Drives": 0.6,
-        "Catch & shoot 3PA": 0.4, "Post touches": -0.4,
+        "Passes made": 1.1, "Potential assists": 0.9, "Drive FGA": 0.6,
+        "Assists per pass": 0.6, "Pull-up 3PA": -0.3, "Post-up FGA": -0.4,
+        "Blocks": -0.3,
     },
     "Off-ball shooter": {
-        "Catch & shoot 3PA": 1.2, "Seconds per touch": -0.7, "Dribbles per touch": -0.8,
-        "Time of possession": -0.6, "Paint touches": -0.5, "Speed on offense": 0.4,
+        "Catch & shoot 3PA": 1.2, "Catch & shoot FGA": 1.0,
+        "Pull-up FGA": -0.7, "Potential assists": -0.6, "Passes made": -0.5,
+        "Post-up FGA": -0.4, "Offensive rebounds": -0.3,
     },
     "Slashing wing": {
-        "Drives": 1.0, "Paint touches": 0.6, "Speed on offense": 0.5,
-        "Points per touch": 0.4, "Catch & shoot 3PA": 0.3, "Post touches": -0.3,
+        "Drive FGA": 1.1, "Paint FGA": 0.6, "Steals": 0.5,
+        "Pull-up FGA": 0.3, "Catch & shoot 3PA": -0.3, "Blocks": -0.3,
     },
     "Defensive specialist": {
-        "Steals": 0.9, "Rim shots defended": 0.7, "Blocks": 0.6,
-        "Def. board chances": 0.5, "Time of possession": -0.7,
-        "Pull-up FGA": -0.6, "Potential assists": -0.5,
+        "Steals": 1.0, "Blocks": 0.8, "Defensive rebounds": 0.6,
+        "Pull-up FGA": -0.7, "Potential assists": -0.6, "Post-up FGA": -0.5,
     },
     "Low-usage connector": {
-        "Passes made": 0.6, "Speed on offense": 0.4, "Time of possession": -0.8,
-        "Pull-up FGA": -0.7, "Post touches": -0.5, "Paint touches": -0.3,
+        "Passes made": 0.7, "Catch & shoot 3PA": 0.5, "Steals": 0.4,
+        "Pull-up FGA": -0.8, "Post-up FGA": -0.6, "Potential assists": -0.4,
     },
 }
 
@@ -196,7 +230,12 @@ def build_archetype_features(tracking: pd.DataFrame,
 
     for column, name, per36 in FEATURES:
         values = pd.to_numeric(frame[column], errors="coerce")
-        out[name] = (values / frame["MIN"] * PER).values if per36 else values.values
+        if per36:
+            # A count column is blank when the player has none of that shot
+            # type all season, which is a zero and not a missing value.
+            out[name] = (values.fillna(0.0) / frame["MIN"] * PER).values
+        else:
+            out[name] = values.values
 
     return out.dropna(subset=FEATURE_NAMES).reset_index(drop=True)
 
@@ -254,15 +293,22 @@ def fit_archetypes(features: pd.DataFrame, k: int | None = None,
 
     scores: dict[int, float] = {}
     if k is None:
+        balanced: dict[int, float] = {}
         for candidate in K_RANGE:
             if candidate >= len(features):
                 continue
             labels = KMeans(n_clusters=candidate, n_init=10,
                             random_state=seed).fit_predict(z)
-            scores[candidate] = float(silhouette_score(z, labels))
+            score = float(silhouette_score(z, labels))
+            scores[candidate] = score
+            shares = np.bincount(labels, minlength=candidate) / len(labels)
+            if shares.max() <= MAX_CLUSTER_SHARE and shares.min() >= MIN_CLUSTER_SHARE:
+                balanced[candidate] = score
         if not scores:
             raise ValueError("not enough players to cluster")
-        k = max(scores, key=scores.get)
+        # Fall back to the plain best silhouette if nothing is balanced, rather
+        # than refusing to cluster at all.
+        k = max(balanced or scores, key=(balanced or scores).get)
 
     model = KMeans(n_clusters=k, n_init=10, random_state=seed).fit(z)
     labels = model.labels_
