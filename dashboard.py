@@ -28,6 +28,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+from advanced_metrics import (
+    AVERAGE_WS48,
+    STAR_TIER,
+    build_box_panel,
+    build_tier_features,
+    fit_star_tiers,
+    impact_metrics,
+)
 from archetypes import MIN_MINUTES, build_archetype_features, fit_archetypes
 from true_shooting import (
     build_shooting_panel,
@@ -36,11 +44,15 @@ from true_shooting import (
 )
 from dashboard_tables import (
     PERCENTILE_COL,
+    impact_profile,
     percentile_color,
     player_summary,
     pnr_leaderboard,
     pnr_profile,
     shooting_profile,
+    star_leaderboard,
+    star_tier_table,
+    style_impact,
     style_table,
     touch_profile,
 )
@@ -160,6 +172,33 @@ def load_projection():
                                  calibration=calibration)
 
 
+@st.cache_data(show_spinner="Reconstructing the box score…")
+def load_impact():
+    """Box plus/minus and win shares per 48, or None if a pull is missing.
+
+    Cached as one unit with the star tiers below it because the clustering is
+    over the metrics: fitting them separately would reconstruct the same box
+    score twice.
+    """
+    if not (TRACKING_PATH.exists() and POSSESSIONS_PATH.exists()):
+        return None
+    panel = build_box_panel(load_shots(), load_possessions(),
+                            pd.read_csv(TRACKING_PATH), box=load_box_stats())
+    return impact_metrics(panel)
+
+
+@st.cache_data(show_spinner="Finding the stars…")
+def load_star_tiers():
+    """Cluster the league into impact tiers, or None if the metrics are absent."""
+    model = load_impact()
+    if model is None:
+        return None
+    features = build_tier_features(model.table)
+    if features.empty:
+        return None
+    return fit_star_tiers(features)
+
+
 @st.cache_data
 def load_pick_and_roll() -> pd.DataFrame | None:
     """Build the league-wide pick and roll dataset, or None if not pulled yet."""
@@ -191,6 +230,8 @@ possessions = load_possessions()
 touches = load_touches()
 pnr = load_pick_and_roll()
 archetypes = load_archetypes()
+impact = load_impact()
+tiers = load_star_tiers()
 
 teams = sorted(splits["TEAM_NAME"].dropna().unique())
 
@@ -245,12 +286,29 @@ with card_right:
         + f" · {SEASON}</div></div>",
         unsafe_allow_html=True,
     )
+    # Two chips, deliberately: the archetype says how a player is used, the
+    # tier says how much he is worth. They are different questions and the
+    # answer to one does not imply the other.
     archetype = archetypes.label_of(player_id) if archetypes else None
+    tier = tiers.tier_of(player_id) if tiers else None
+    chips = []
     if archetype:
+        chips.append((archetype, accent, "#fff"))
+    if tier:
+        # The star tier is the only one that gets to shout.
+        star = tier == STAR_TIER
+        chips.append((tier, "#B2182B" if star else "transparent",
+                      "#fff" if star else "inherit"))
+    if chips:
         st.markdown(
-            f"<span style='display:inline-block;margin-top:8px;padding:4px 12px;"
-            f"border-radius:999px;background:{accent};color:#fff;font-size:.85rem;"
-            f"font-weight:600'>{archetype}</span>",
+            "".join(
+                f"<span style='display:inline-block;margin-top:8px;margin-right:8px;"
+                f"padding:4px 12px;border-radius:999px;background:{background};"
+                f"color:{text};font-size:.85rem;font-weight:600;"
+                f"border:1px solid {accent if background == 'transparent' else background}'>"
+                f"{label}</span>"
+                for label, background, text in chips
+            ),
             unsafe_allow_html=True,
         )
 
@@ -263,8 +321,9 @@ with card_right:
 
 st.divider()
 
-scouting_tab, touches_tab, archetype_tab, shooting_tab = st.tabs(
-    ["Scouting", "Touches & Pick and Roll", "Archetypes", "Projected true shooting"]
+scouting_tab, touches_tab, impact_tab, archetype_tab, shooting_tab = st.tabs(
+    ["Scouting", "Touches & Pick and Roll", "Impact & stars", "Archetypes",
+     "Projected true shooting"]
 )
 
 with scouting_tab:
@@ -400,6 +459,127 @@ with touches_tab:
                     hide_index=True,
                     height=360,
                 )
+
+
+with impact_tab:
+    st.subheader("Impact")
+
+    if impact is None:
+        st.warning(
+            "Box plus/minus and win shares need the tracking and possessions "
+            "pulls. Run `pull_tracking_stats()` from `scraper_functions.py`."
+        )
+    else:
+        st.caption(
+            f"There is no box score in the committed pulls, so one is "
+            f"reconstructed: points and minutes from the possessions pull, field "
+            f"goals from the shot chart, free throws from the difference between "
+            f"them, and rebounds, assists, steals and blocks from the tracking "
+            f"pulls. League pace comes out at {impact.pace:.0f} possessions per 48 "
+            f"minutes and {impact.points_per_possession:.3f} points per possession. "
+            + ("Turnovers are the one estimate — the pulls only track them on "
+               "drives and on paint, post and elbow touches, so the rest are "
+               "spread over each player's untracked touches."
+               if impact.turnovers_estimated else
+               "Turnovers come from the box score pull.")
+        )
+
+        impact_left, impact_right = st.columns([3, 2])
+
+        with impact_left:
+            st.dataframe(style_impact(impact_profile(impact, player_id)),
+                         hide_index=True)
+            st.caption(
+                f"Box plus/minus is points added per 100 possessions over an "
+                f"average player, so the league averages 0 by construction. Win "
+                f"shares per 48 averages {AVERAGE_WS48:.3f} for the same reason "
+                f"win shares sum to wins: teams average .500, so a player who "
+                f"plays a fifth of his team's minutes earns a fifth of 41 wins. "
+                f"Percentiles rank against everyone over {MIN_MINUTES:,.0f} minutes."
+            )
+
+        with impact_right:
+            row = impact.of(player_id)
+            if row is None:
+                st.info(
+                    f"No shot chart for {player_name}, so there is no "
+                    "reconstructed box score to price."
+                )
+            else:
+                st.markdown("**Where the points come from**")
+                # The two halves in points, not per 100, because this is about
+                # what a player did rather than at what rate.
+                halves = pd.DataFrame({
+                    "Points added": [row["OFF_POINTS_ADDED"], row["DEF_POINTS_ADDED"]],
+                }, index=["Offence", "Defence"])
+                st.bar_chart(halves, horizontal=True)
+                st.caption(
+                    "Every box event priced in points against what an average "
+                    "possession is worth: scoring above league true shooting on "
+                    "the same volume, the points a pass sets up, a turnover "
+                    "against the possession it cost, rebounds against the share "
+                    "a teammate would have got anyway, and stops."
+                )
+
+    st.divider()
+    st.subheader("Stars")
+
+    if tiers is None:
+        st.info("The star tiers need the impact metrics above.")
+    else:
+        star_count = len(tiers.stars)
+        st.caption(
+            f"A second clustering, on the other axis from the archetypes. Those "
+            f"divide volume out on purpose — their question is what a player "
+            f"does — so they cannot tell a bench guard from a franchise guard "
+            f"who takes the same shots. These put volume back in: box plus/minus "
+            f"and win shares against points, shot volume, points created and "
+            f"minutes per game. k = {tiers.k}, chosen by silhouette score "
+            f"({tiers.silhouette:.3f}) subject to the top tier holding no more "
+            f"than a fraction of the league, and the tiers are named by where "
+            f"their centres rank rather than by hand. It lands on {star_count} "
+            f"stars out of {len(tiers.table)} clustered players."
+        )
+
+        tier = tiers.tier_of(player_id)
+        if tier is None:
+            st.info(
+                f"{player_name} is under the {MIN_MINUTES:,.0f} minute floor, so "
+                "he is not placed in a tier."
+            )
+        else:
+            st.markdown(f"**{player_name} — {tier}**")
+
+        st.dataframe(
+            star_tier_table(tiers),
+            hide_index=True,
+            column_config={
+                "Box +/-": st.column_config.NumberColumn(format="%+.1f"),
+                "WS/48": st.column_config.NumberColumn(format="%.3f"),
+                "Minutes / game": st.column_config.NumberColumn(format="%.1f"),
+                "Points / game": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        st.caption(
+            "The two middle tiers separate on minutes as much as on quality — a "
+            "bench big who rebounds well in nineteen minutes rates ahead of a "
+            "starter per possession and behind him per night, which is what the "
+            "column that defines each tier is there to show."
+        )
+
+        st.markdown("**The star tier**")
+        st.dataframe(
+            star_leaderboard(tiers, impact),
+            hide_index=True,
+            height=360,
+            column_config={
+                "Box +/-": st.column_config.NumberColumn(format="%+.1f"),
+                "WS/48": st.column_config.NumberColumn(format="%.3f"),
+                "Win shares": st.column_config.NumberColumn(format="%.1f"),
+                "Points / game": st.column_config.NumberColumn(format="%.1f"),
+                "Minutes / game": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
 
 
 with archetype_tab:
