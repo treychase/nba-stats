@@ -1,5 +1,6 @@
 matplotlib
 nba_api
 pandas
+scikit-learn
 streamlit
 tqdm

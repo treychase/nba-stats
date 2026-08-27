@@ -3,6 +3,10 @@ NBA Scouting Dashboard
 ------------------------
 Streamlit app for scouting a single player.
 
+Pick a team and a player at the top. The card that appears carries their
+headshot, their team, and their season counting stats; both tabs below then
+scout that player.
+
 Scouting tab: a hex bin shot chart that can be sliced by shot type, next
 to their shooting splits with league percentiles.
 
@@ -13,6 +17,9 @@ roll man, all against league percentiles.
 Run with: streamlit run dashboard.py
 
 Requires: pip install -r requirements.txt
+
+The team and player are mirrored into the URL, so a scouting view can be
+pasted to someone else and it opens on the same player.
 """
 
 from pathlib import Path
@@ -20,13 +27,22 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
-from matplotlib import colormaps
-from matplotlib.colors import to_hex
 
+from archetypes import MIN_MINUTES, build_archetype_features, fit_archetypes
+from dashboard_tables import (
+    PERCENTILE_COL,
+    percentile_color,
+    player_summary,
+    pnr_leaderboard,
+    pnr_profile,
+    shooting_profile,
+    style_table,
+    touch_profile,
+)
+from player_media import headshot_html, team_color
 from plot_functions import plot_shot_hexbin, plot_touch_areas
 from processing_functions import (
     PNR_ROLES,
-    SHOOTING_METRICS,
     SHOT_TYPE_LABELS,
     TOUCH_AREAS,
     add_shot_type_column,
@@ -38,6 +54,7 @@ from processing_functions import (
 SEASON = "2025-26"
 DATA_DIR = Path(__file__).parent / "data"
 SHOT_CHART_PATH = DATA_DIR / f"nba_shot_chart_{SEASON}.csv"
+TRACKING_PATH = DATA_DIR / f"nba_tracking_combined_{SEASON}.csv"
 BOX_STATS_PATH = DATA_DIR / f"nba_player_box_{SEASON}.csv"
 POSSESSIONS_PATH = DATA_DIR / f"tracking_possessions_{SEASON}.csv"
 PNR_PATH = DATA_DIR / f"nba_pick_and_roll_combined_{SEASON}.csv"
@@ -47,14 +64,35 @@ PNR_PATH = DATA_DIR / f"nba_pick_and_roll_combined_{SEASON}.csv"
 # shooting splits rely on, so the classification lands in its own column.
 SHOT_TYPE_GROUP_COL = "SHOT_TYPE_GROUP"
 
-PERCENTILE_COL = "League %ile"
-
 
 # ---------------------------------------------------------------------------
 # Data loading
+#
+# The two required files are checked before anything is read, so a fresh clone
+# without them gets a sentence saying which pull to run instead of a traceback
+# in the middle of the page.
 # ---------------------------------------------------------------------------
 
-@st.cache_data
+REQUIRED = {
+    SHOT_CHART_PATH: "pull_shot_chart()",
+    POSSESSIONS_PATH: "pull_tracking_stats()",
+}
+
+
+def require_data() -> None:
+    """Stop with an explanation if a file the whole app depends on is absent."""
+    missing = [(path, call) for path, call in REQUIRED.items() if not path.exists()]
+    if not missing:
+        return
+    lines = "\n".join(
+        f"- `data/{path.name}` — run `{call}` from `scraper_functions.py`"
+        for path, call in missing
+    )
+    st.error(f"The dashboard needs data that is not in `data/` yet:\n\n{lines}")
+    st.stop()
+
+
+@st.cache_data(show_spinner="Loading shots…")
 def load_shots() -> pd.DataFrame:
     """Load per-shot data and tag each shot with its shot type category."""
     shots = pd.read_csv(SHOT_CHART_PATH)
@@ -69,16 +107,33 @@ def load_box_stats() -> pd.DataFrame | None:
     return pd.read_csv(BOX_STATS_PATH)
 
 
-@st.cache_data
+@st.cache_data(show_spinner="Building shooting splits…")
 def load_splits() -> pd.DataFrame:
     """Build the league-wide shooting profile dataset with percentiles."""
     return build_shooting_splits(load_shots(), box=load_box_stats())
 
 
 @st.cache_data
+def load_possessions() -> pd.DataFrame:
+    """Raw tracking possessions: the source of the header card's counting stats."""
+    return pd.read_csv(POSSESSIONS_PATH)
+
+
+@st.cache_data
 def load_touches() -> pd.DataFrame:
     """Build the league-wide touch location dataset with percentiles."""
-    return build_touch_profile(pd.read_csv(POSSESSIONS_PATH))
+    return build_touch_profile(load_possessions())
+
+
+@st.cache_data(show_spinner="Clustering archetypes…")
+def load_archetypes():
+    """Cluster the league into archetypes, or None if tracking is not pulled."""
+    if not TRACKING_PATH.exists():
+        return None
+    features = build_archetype_features(pd.read_csv(TRACKING_PATH))
+    if features.empty:
+        return None
+    return fit_archetypes(features)
 
 
 @st.cache_data
@@ -89,150 +144,104 @@ def load_pick_and_roll() -> pd.DataFrame | None:
     return build_pick_and_roll_profile(pd.read_csv(PNR_PATH))
 
 
-# ---------------------------------------------------------------------------
-# Table formatting
-# ---------------------------------------------------------------------------
-
-def percentile_color(percentile: float) -> str | None:
-    """Red-to-green fill for a 0-100 percentile, or None if unranked."""
-    if pd.isna(percentile):
+def player_tricode(possessions: pd.DataFrame, player_id: int) -> str | None:
+    """The player's team tricode, used for the card's colour and monogram."""
+    match = possessions.loc[possessions["PLAYER_ID"] == player_id]
+    if match.empty or "TEAM_ABBREVIATION" not in match.columns:
         return None
-    return to_hex(colormaps["RdYlGn"](float(percentile) / 100))
-
-
-def percentile_css(percentile: float) -> str:
-    """Cell styling for a 0-100 percentile, blank if unranked."""
-    background = percentile_color(percentile)
-    if background is None:
-        return ""
-    # Fixed dark text: the colormap is light in the middle, so inheriting the
-    # theme's font color would wash out in dark mode.
-    return f"background-color: {background}; color: #262730"
-
-
-def style_table(table: pd.DataFrame, formats: dict):
-    """Format a table's numbers and shade its percentile column red to green.
-
-    Values are formatted to strings up front rather than left to the Styler,
-    because st.dataframe renders the underlying data through Arrow and shows
-    missing entries as "None" instead of honouring the Styler's na_rep.
-    """
-    percentiles = pd.to_numeric(table[PERCENTILE_COL], errors="coerce")
-    formats = {PERCENTILE_COL: "{:.0f}", **formats}
-
-    display = pd.DataFrame(index=table.index)
-    for column in table.columns:
-        if column in formats:
-            spec = formats[column]
-            display[column] = [
-                spec.format(value) if pd.notna(value) else "—"
-                for value in pd.to_numeric(table[column], errors="coerce")
-            ]
-        else:
-            display[column] = table[column].fillna("—")
-
-    styles = [percentile_css(percentile) for percentile in percentiles]
-    return display.style.apply(lambda _column: styles, subset=[PERCENTILE_COL])
-
-
-# ---------------------------------------------------------------------------
-# Per-player tables
-# ---------------------------------------------------------------------------
-
-def shooting_profile(splits: pd.DataFrame, player_id: int) -> pd.DataFrame:
-    """One row per shooting metric: value, attempts, percentile."""
-    row = splits.loc[splits["PLAYER_ID"] == player_id].iloc[0]
-
-    return pd.DataFrame(
-        [
-            {
-                "Metric": label,
-                "Value": pd.to_numeric(row[value_col], errors="coerce"),
-                "Attempts": pd.to_numeric(row[attempts_col], errors="coerce"),
-                PERCENTILE_COL: row[f"{value_col}_PCTILE"],
-            }
-            for value_col, label, attempts_col, _min_attempts in SHOOTING_METRICS
-        ]
-    )
-
-
-def touch_profile(touches: pd.DataFrame, player_id: int) -> pd.DataFrame:
-    """One row per court area: share of touches, touch count, percentile."""
-    row = touches.loc[touches["PLAYER_ID"] == player_id].iloc[0]
-
-    return pd.DataFrame(
-        [
-            {
-                "Area": label,
-                "Share of touches": pd.to_numeric(row[share_col], errors="coerce"),
-                "Touches": pd.to_numeric(row[count_col], errors="coerce"),
-                PERCENTILE_COL: row[f"{share_col}_PCTILE"],
-            }
-            for share_col, label, count_col, _area_key in TOUCH_AREAS
-        ]
-    )
-
-
-def pnr_profile(pnr: pd.DataFrame, player_id: int) -> pd.DataFrame:
-    """One row per pick and roll role: points, possessions, percentile."""
-    match = pnr.loc[pnr["PLAYER_ID"] == player_id]
-    row = match.iloc[0] if not match.empty else None
-
-    return pd.DataFrame(
-        [
-            {
-                "Role": label,
-                "Points": pd.to_numeric(row[f"{prefix}_PTS"], errors="coerce") if row is not None else None,
-                "Possessions": pd.to_numeric(row[f"{prefix}_POSS"], errors="coerce") if row is not None else None,
-                PERCENTILE_COL: row[f"{prefix}_PTS_PCTILE"] if row is not None else None,
-            }
-            for prefix, label, _play_type in PNR_ROLES
-        ]
-    )
-
-
-def pnr_leaderboard(pnr: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    """Every player who logs possessions in one pick and roll role."""
-    board = pnr.loc[pnr[f"{prefix}_POSS"].notna()].sort_values(f"{prefix}_PTS", ascending=False)
-
-    return pd.DataFrame(
-        {
-            "Player": board["PLAYER_NAME"].values,
-            "Team": (
-                board["TEAM_ABBREVIATION"].values
-                if "TEAM_ABBREVIATION" in board.columns
-                else "—"
-            ),
-            "Points": board[f"{prefix}_PTS"].values,
-            "Possessions": board[f"{prefix}_POSS"].values,
-            PERCENTILE_COL: board[f"{prefix}_PTS_PCTILE"].values,
-        }
-    )
+    value = match["TEAM_ABBREVIATION"].iloc[0]
+    return None if pd.isna(value) else str(value)
 
 
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="NBA Scouting", layout="wide")
+st.set_page_config(page_title="NBA Scouting", page_icon="🏀", layout="wide")
+
+require_data()
 
 shots = load_shots()
 splits = load_splits()
+possessions = load_possessions()
 touches = load_touches()
 pnr = load_pick_and_roll()
+archetypes = load_archetypes()
+
+teams = sorted(splits["TEAM_NAME"].dropna().unique())
+
+# The URL carries the current selection, so a view can be shared as a link.
+params = st.query_params
+default_team = params.get("team")
+team_index = teams.index(default_team) if default_team in teams else 0
 
 team_col, player_col, _spacer = st.columns([1, 1, 2])
 
 with team_col:
-    team = st.selectbox("Team", sorted(splits["TEAM_NAME"].dropna().unique()))
+    team = st.selectbox("Team", teams, index=team_index)
 
 roster = splits.loc[splits["TEAM_NAME"] == team].sort_values("PLAYER_NAME")
+names = roster["PLAYER_NAME"].tolist()
+
+if not names:
+    st.warning(f"No players with shot data for {team}.")
+    st.stop()
+
+default_player = params.get("player")
+player_index = names.index(default_player) if default_player in names else 0
+
 with player_col:
-    player_name = st.selectbox("Player", roster["PLAYER_NAME"].tolist())
+    player_name = st.selectbox("Player", names, index=player_index)
 
 player_id = int(roster.loc[roster["PLAYER_NAME"] == player_name, "PLAYER_ID"].iloc[0])
+tricode = player_tricode(possessions, player_id)
 
-scouting_tab, touches_tab = st.tabs(["Scouting", "Touches & Pick and Roll"])
+if params.get("team") != team or params.get("player") != player_name:
+    st.query_params.update({"team": team, "player": player_name})
+
+# ---------------------------------------------------------------------------
+# Player card
+# ---------------------------------------------------------------------------
+
+summary = player_summary(possessions, player_id)
+accent = team_color(tricode)
+
+card_left, card_right = st.columns([1, 3])
+
+with card_left:
+    st.markdown(headshot_html(player_id, player_name, tricode, height=150),
+                unsafe_allow_html=True)
+
+with card_right:
+    st.markdown(
+        f"<div style='border-left:5px solid {accent};padding-left:14px'>"
+        f"<div style='font-size:1.6rem;font-weight:700;line-height:1.2'>{player_name}</div>"
+        f"<div style='opacity:.75'>{team}"
+        + (f" · {tricode}" if tricode else "")
+        + f" · {SEASON}</div></div>",
+        unsafe_allow_html=True,
+    )
+    archetype = archetypes.label_of(player_id) if archetypes else None
+    if archetype:
+        st.markdown(
+            f"<span style='display:inline-block;margin-top:8px;padding:4px 12px;"
+            f"border-radius:999px;background:{accent};color:#fff;font-size:.85rem;"
+            f"font-weight:600'>{archetype}</span>",
+            unsafe_allow_html=True,
+        )
+
+    if summary:
+        stat_cols = st.columns(len(summary))
+        for column, (label, value) in zip(stat_cols, summary.items()):
+            column.metric(label, f"{value:,.0f}")
+    else:
+        st.caption("No tracking row for this player, so counting stats are unavailable.")
+
+st.divider()
+
+scouting_tab, touches_tab, archetype_tab = st.tabs(
+    ["Scouting", "Touches & Pick and Roll", "Archetypes"]
+)
 
 with scouting_tab:
     player_shots = shots.loc[shots["PLAYER_ID"] == player_id]
@@ -367,3 +376,82 @@ with touches_tab:
                     hide_index=True,
                     height=360,
                 )
+
+
+with archetype_tab:
+    st.subheader("Archetypes")
+
+    if archetypes is None:
+        st.warning(
+            "Archetypes need the combined tracking pull. Run `pull_tracking_stats()` "
+            f"from scraper_functions.py and save the result to `data/{TRACKING_PATH.name}`."
+        )
+    else:
+        st.caption(
+            f"K-means over {len(archetypes.table)} players with at least "
+            f"{MIN_MINUTES:,.0f} minutes, on per-36 tracking rates. "
+            f"k = {archetypes.k}, chosen by silhouette score ({archetypes.silhouette:.3f}); "
+            "each cluster is named after the prototype its centre points towards, and "
+            "the features that earned the name are listed with it."
+        )
+
+        label = archetypes.label_of(player_id)
+        if label is None:
+            st.info(
+                f"{player_name} is under the {MIN_MINUTES:,.0f} minute floor, so they are "
+                "not clustered. Rate stats on a small sample would move the cluster "
+                "centres more than they would describe the player."
+            )
+        else:
+            cluster = int(
+                archetypes.table.loc[
+                    archetypes.table["PLAYER_ID"] == player_id, "CLUSTER"
+                ].iloc[0]
+            )
+            profile_col, similar_col = st.columns([3, 2])
+
+            with profile_col:
+                st.markdown(f"**{player_name} — {label}**")
+                player_z = archetypes.profile_of(player_id)
+                centre = archetypes.centroids.loc[cluster]
+                order = player_z.abs().sort_values(ascending=False).index[:8]
+                comparison = pd.DataFrame(
+                    {"This player": player_z[order], f"{label} average": centre[order]}
+                )
+                st.bar_chart(comparison, horizontal=True)
+                st.caption(
+                    "Standard deviations from the league average, on the eight features "
+                    "where this player is furthest from it. The second bar is the "
+                    "archetype's own centre, so the gap is how typical they are of it."
+                )
+
+            with similar_col:
+                st.markdown("**Most similar players**")
+                similar = archetypes.similar_players(player_id, n=6)
+                st.dataframe(
+                    similar.rename(columns={"PLAYER_NAME": "Player", "ARCHETYPE": "Archetype"}),
+                    hide_index=True,
+                    column_config={
+                        "Distance": st.column_config.NumberColumn(format="%.2f")
+                    },
+                )
+                st.caption(
+                    "Closest in the same feature space, so this reads as used the same "
+                    "way rather than scores the same amount."
+                )
+
+        st.divider()
+        st.markdown("**The archetypes**")
+        summary_rows = []
+        for cluster_id, name in sorted(archetypes.names.items(), key=lambda kv: kv[1]):
+            members = archetypes.table.loc[archetypes.table["CLUSTER"] == cluster_id]
+            top = archetypes.distinguishing(cluster_id, 3)
+            summary_rows.append({
+                "Archetype": name,
+                "Players": len(members),
+                "What defines it": ", ".join(
+                    f"{feature} {value:+.1f}" for feature, value in top.items()
+                ),
+                "Most minutes": ", ".join(members.nlargest(3, "MIN")["PLAYER_NAME"]),
+            })
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True)
