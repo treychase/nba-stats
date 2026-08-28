@@ -297,11 +297,23 @@ def pull_shot_chart(min_shots: int = 50, max_workers: int = 8) -> pd.DataFrame:
 BOX_TOTALS_COLUMNS = [
     "PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION", "GP", "MIN",
     "PTS", "FGM", "FGA", "FG_PCT", "FG3M", "FG3A", "FG3_PCT", "FTM", "FTA", "FT_PCT",
+    # Turnovers and fouls are the two counts the tracking pulls do not carry in
+    # full: they count turnovers only on the plays they track, and the fouls
+    # they count are fouls drawn rather than committed. advanced_metrics.py
+    # estimates turnovers when this file is absent and uses the real column
+    # when it is here, so pulling this is a straight upgrade to box plus/minus
+    # and win shares.
+    "TOV", "PF", "OREB", "DREB", "REB", "AST", "STL", "BLK", "PLUS_MINUS",
 ]
 
 
 def pull_player_box_stats() -> pd.DataFrame:
-    """Pull season box score totals for every player, save CSV, return DataFrame."""
+    """Pull season box score totals for every player, save CSV, return DataFrame.
+
+    Only the columns the reconstruction cannot recover exactly are worth
+    anything here - turnovers above all. Everything else is a cross-check on
+    what the tracking pulls already carry.
+    """
     def _fetch():
         response = leaguedashplayerstats.LeagueDashPlayerStats(
             season=SEASON,

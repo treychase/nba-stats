@@ -17,6 +17,7 @@ from matplotlib.colors import to_hex
 from processing_functions import PNR_ROLES, SHOOTING_METRICS, TOUCH_AREAS
 
 __all__ = [
+    "IMPACT_METRICS",
     "PERCENTILE_COL",
     "PERCENTILE_CMAP",
     "percentile_color",
@@ -27,6 +28,9 @@ __all__ = [
     "touch_profile",
     "pnr_profile",
     "pnr_leaderboard",
+    "impact_profile",
+    "star_tier_table",
+    "star_leaderboard",
 ]
 
 PERCENTILE_COL = "League %ile"
@@ -36,11 +40,16 @@ PERCENTILE_COL = "League %ile"
 # Percentile shading
 # ---------------------------------------------------------------------------
 
-# Orange for below average, purple for above, near-white through the middle.
-# Deliberately not red-to-green: that pairing is the one diverging scale
-# red-green colorblind readers cannot split, and a percentile column is
-# useless if half its range reads the same as the other half.
-PERCENTILE_CMAP = "PuOr"
+# Blue for below average, red for above, near-white through the middle - the
+# same scale the shot chart already colours field goal percentage on, so a
+# percentile and a hot spot read the same way across the whole app.
+#
+# Still deliberately not red-to-green: that pairing is the one diverging scale
+# red-green colourblind readers cannot split, and a percentile column is
+# useless if half its range reads the same as the other half. Red against blue
+# separates on lightness as well as hue, so it survives both common forms of
+# colour blindness and a black and white printout.
+PERCENTILE_CMAP = "coolwarm"
 
 
 def percentile_color(percentile) -> str | None:
@@ -208,3 +217,103 @@ def pnr_leaderboard(pnr: pd.DataFrame, prefix: str) -> pd.DataFrame:
             PERCENTILE_COL: board[f"{prefix}_PTS_PCTILE"].values,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Impact: box plus/minus and win shares
+# ---------------------------------------------------------------------------
+
+IMPACT_METRICS = [
+    # (column, label, format, the units the number is in)
+    ("BPM", "Box +/-", "{:+.1f}", "points per 100 possessions, over average"),
+    ("OBPM", "Offensive box +/-", "{:+.1f}", "the offensive half of it"),
+    ("DBPM", "Defensive box +/-", "{:+.1f}", "the defensive half"),
+    ("WS48", "Win shares / 48", "{:.3f}", "an average player earns 0.100"),
+    ("WS", "Win shares", "{:.1f}", "wins, on the season so far"),
+]
+
+
+def impact_profile(impact, player_id: int) -> pd.DataFrame:
+    """One row per impact metric: value and league percentile.
+
+    ``impact`` is an :class:`advanced_metrics.ImpactModel`. A player with no
+    reconstructed box score - anyone the shot chart does not cover - comes back
+    as a full table of dashes rather than an empty one, so the panel keeps its
+    shape instead of disappearing.
+    """
+    row = impact.of(player_id) if impact is not None else None
+
+    def value_of(column):
+        if row is None or column not in row.index:
+            return None
+        return pd.to_numeric(row[column], errors="coerce")
+
+    return pd.DataFrame(
+        [
+            {
+                "Metric": label,
+                "Value": value_of(column),
+                "What it means": meaning,
+                PERCENTILE_COL: value_of(f"{column}_PCTILE"),
+            }
+            for column, label, _spec, meaning in IMPACT_METRICS
+        ]
+    )
+
+
+def impact_formats() -> dict:
+    """Number formats for :func:`impact_profile`, which mixes two scales.
+
+    Box plus/minus wants a sign and one decimal, win shares per 48 wants three
+    and no sign, so the column is formatted row by row before it is styled -
+    the same reason :func:`style_table` formats to strings up front.
+    """
+    return {column: spec for column, _label, spec, _meaning in IMPACT_METRICS}
+
+
+def style_impact(table: pd.DataFrame):
+    """Format and shade the impact table, one number format per row."""
+    specs = [spec for _column, _label, spec, _meaning in IMPACT_METRICS]
+    display = table.copy()
+    display["Value"] = [
+        spec.format(value) if pd.notna(value) else "—"
+        for spec, value in zip(specs, pd.to_numeric(table["Value"], errors="coerce"))
+    ]
+    percentiles = pd.to_numeric(table[PERCENTILE_COL], errors="coerce")
+    display[PERCENTILE_COL] = [
+        f"{value:.0f}" if pd.notna(value) else "—" for value in percentiles
+    ]
+    styles = [percentile_css(percentile) for percentile in percentiles]
+    return display.style.apply(lambda _column: styles, subset=[PERCENTILE_COL])
+
+
+def star_tier_table(tiers) -> pd.DataFrame:
+    """Every tier, strongest first, with what defines it and who leads it."""
+    if tiers is None:
+        return pd.DataFrame()
+    summary = tiers.summary()
+    return summary.rename(columns={
+        "TIER": "Tier", "PLAYERS": "Players", "BPM": "Box +/-",
+        "WS48": "WS/48", "MPG": "Minutes / game", "PTS_PG": "Points / game",
+        "DEFINES": "What defines it", "LEADERS": "Most win shares",
+    })
+
+
+def star_leaderboard(tiers, impact, n: int | None = None) -> pd.DataFrame:
+    """The star tier, best box plus/minus first."""
+    if tiers is None:
+        return pd.DataFrame()
+    board = tiers.stars
+    if n is not None:
+        board = board.head(n)
+    out = pd.DataFrame({
+        "Player": board["PLAYER_NAME"].values,
+        "Team": (board["TEAM_ABBREVIATION"].values
+                 if "TEAM_ABBREVIATION" in board.columns else "—"),
+        "Box +/-": board["BPM"].values,
+        "WS/48": board["WS48"].values,
+        "Win shares": board["WS"].values,
+        "Points / game": board["PTS_PG"].values,
+        "Minutes / game": board["MPG"].values,
+    })
+    return out

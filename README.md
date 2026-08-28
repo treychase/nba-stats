@@ -72,6 +72,85 @@ The tab shows the player against their archetype's centre on the features they
 differ from league average on most, the closest players to them in the same
 feature space, and a table of every archetype with what defines it.
 
+### Impact and stars
+
+Two questions a shot chart cannot answer: what is this player worth per
+possession, and how many wins is that. Both are box score metrics, and the
+committed pulls carry no box score — so `advanced_metrics.py` reconstructs one
+and builds both on top of it.
+
+Everything except turnovers comes out of the pulls exactly. Points and minutes
+from the possessions pull, field goals from the shot chart, free throws from
+the difference between the two (the same arithmetic the true shooting section
+uses), and rebounds, assists, steals, blocks and rim defence from the tracking
+pulls. Summed over the league that lands on 115.3 points, 88.8 field goal
+attempts, 32.2 defensive rebounds and 26.6 assists per team game — the season's
+real rates, which is the check that nobody is being dropped or double counted.
+
+**Turnovers are the one estimate.** The pulls count them on the plays they
+track — drives, and paint, post and elbow touches — which is about a third of
+them. The rest are charged to each player's untracked touches at one league
+rate, set so the league total comes out at the 13.0% of possessions everybody
+knows it to be. That is the same kind of constant as the 0.44 in true shooting
+attempts, and it is a module constant: when `data/nba_player_box_2025-26.csv`
+carries a `TOV` column the real number is used and the estimate is never
+reached.
+
+Both metrics are built from one **possession-value framework**. Every box event
+is priced in points against what a possession is worth, and because those
+prices are estimates rather than fitted weights — there is no play-by-play here
+to regress against — they all sit in one table, `VALUES`, so a reader can
+disagree with a number instead of with an expression. Scoring needs no price at
+all: `2 · TSA · (TS − league TS)` is the points a player scored above what the
+league would have scored on his own volume.
+
+One term is worth pulling out. The tracking pull credits a shot at the rim to
+whoever was nearest, and being nearest is an assignment rather than a choice —
+a guard is the closest defender on a rim attempt mostly when he has already
+been beaten. The league bears that out: defenders in the bottom fifth by rim
+attempts allow 72%, the top fifth 60%. Scoring everyone against one pooled rate
+would hand every centre free credit and charge every guard for playing on the
+perimeter, so the baseline moves with volume — a player is measured against
+what the league allows *at his own rim volume*. What is left is rim protection
+rather than position.
+
+Box plus/minus is those points per 100 possessions, centred so the league's
+minute-weighted average is zero, which is what makes it a plus/minus rather
+than a total. Win shares read the same events through Dean Oliver's framework
+instead — offence against a replacement baseline, defence through stops — which
+is why the two are worth showing together rather than one being a rescaling of
+the other: they correlate at 0.89 and disagree about exactly the players you
+would want them to. League average WS/48 is pinned at 0.100, which is not a
+calibration choice but arithmetic: win shares sum to wins, teams average .500,
+so a player who plays a fifth of his team's minutes earns a fifth of 41 wins.
+
+What is missing is worth saying plainly. There is no opponent data in the
+committed pulls, so every team is treated as league-average defensively — a
+player is credited for the stops he makes and not for the defence around him.
+There are no personal fouls either. And the shot chart only covers players over
+50 attempts, so the fifth of the league below that comes back unranked rather
+than guessed at.
+
+#### Stars, as a clustering
+
+The archetypes divide volume out on purpose, because their question is *what a
+player does*. That makes them exactly the wrong tool for finding stars: a bench
+guard and a franchise guard take the same shots at different volumes and land
+in the same archetype, which is the archetype working correctly.
+
+So stars get their own clustering, on the other axis. Same method, opposite
+feature set — box plus/minus and win shares against points, shot volume, points
+created and minutes **per game** rather than per 36. `k` comes off the
+silhouette score subject to the top tier holding no more than 12% of the
+league, and the tiers are named by where their centres rank rather than by
+hand, so "star" is where the league separates instead of a number somebody
+picked. On the committed pull that lands on five tiers and 27 stars out of 428
+clustered players.
+
+The two middle tiers separate on minutes as much as on quality: a bench big who
+rebounds well in nineteen minutes rates ahead of a starter per possession and
+behind him per night. The table lists what defines each tier for that reason.
+
 ### Projected true shooting
 
 What a player *shot* and what he is likely to shoot next are different
@@ -110,9 +189,13 @@ prediction error by 18% overall — 27% for players under 100 attempts, 12% for
 players over 300. The gain is entirely concentrated where the sample is thin,
 which is the point.
 
-Percentile shading runs orange (below average) through near-white to purple
-(above average) — deliberately not red-to-green, which is the one diverging
-pair red-green colorblind readers can't split.
+Percentile shading runs blue (below average) through near-white to red (above
+average), the same scale the shot chart already colours field goal percentage
+on, so a percentile and a hot spot read the same way across the whole app. Still
+deliberately not red-to-green, which is the one diverging pair red-green
+colorblind readers can't split; red against blue separates on lightness as well
+as hue, so it survives both common forms of colour blindness and a black and
+white printout.
 
 ## Data
 
@@ -123,7 +206,7 @@ aren't committed:
 
 | Missing file | Pull it with | Affects |
 | --- | --- | --- |
-| `data/nba_player_box_2025-26.csv` | `pull_player_box_stats()` | True shooting %, free throw % |
+| `data/nba_player_box_2025-26.csv` | `pull_player_box_stats()` | True shooting %, free throw %, and real turnovers in place of the estimate |
 | `data/nba_pick_and_roll_combined_2025-26.csv` | `pull_pick_and_roll()` | Pick and roll section |
 
 Both live in `scraper_functions.py`. Until the files exist, those rows read `—`
@@ -138,9 +221,9 @@ make lint      # byte-compile every module
 ```
 
 The dashboard's tables (`dashboard_tables.py`), media helpers
-(`player_media.py`), clustering (`archetypes.py`) and shooting model
-(`true_shooting.py`) are kept out of the
-Streamlit script so they can be imported and tested without a Streamlit
+(`player_media.py`), clustering (`archetypes.py`), shooting model
+(`true_shooting.py`) and impact metrics (`advanced_metrics.py`) are kept out of
+the Streamlit script so they can be imported and tested without a Streamlit
 runtime — which is the only way the awkward cases get covered: a player with no
 touch tracking, a metric with too few attempts to qualify, a play type the
 player has never run, a missing portrait. CI runs the same three targets on
